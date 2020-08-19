@@ -1,17 +1,22 @@
+# Copyright Contributors to the Amundsen project.
+# SPDX-License-Identifier: Apache-2.0
+
 import logging
 import re
 from random import randint
 from typing import Any, Dict, List, Union, Optional
 
 from amundsen_common.models.popular_table import PopularTable
-from amundsen_common.models.table import Column, Statistics, Table, Tag, User
+from amundsen_common.models.table import Column, Statistics, Table, Tag, User, Reader,\
+    ProgrammaticDescription, ResourceReport
 from amundsen_common.models.user import User as UserEntity
 from amundsen_common.models.dashboard import DashboardSummary
 from atlasclient.client import Atlas
 from atlasclient.exceptions import BadRequest
 from atlasclient.models import EntityUniqueAttribute
 from atlasclient.utils import (make_table_qualified_name,
-                               parse_table_qualified_name)
+                               parse_table_qualified_name,
+                               extract_entities)
 from beaker.cache import CacheManager
 from beaker.util import parse_cache_config_options
 from flask import current_app as app
@@ -41,8 +46,10 @@ class AtlasProxy(BaseProxy):
     STATISTICS_FORMAT_SPEC = app.config['STATISTICS_FORMAT_SPEC']
     BOOKMARK_TYPE = 'Bookmark'
     USER_TYPE = 'User'
+    READER_TYPE = 'Reader'
     QN_KEY = 'qualifiedName'
     BOOKMARK_ACTIVE_KEY = 'active'
+    ENTITY_ACTIVE_STATUS = 'ACTIVE'
     GUID_KEY = 'guid'
     ATTRS_KEY = 'attributes'
     REL_ATTRS_KEY = 'relationshipAttributes'
@@ -342,6 +349,29 @@ class AtlasProxy(BaseProxy):
             )
         return sorted(columns, key=lambda item: item.sort_order)
 
+    def _get_reports(self, guids: List[str]) -> List[ResourceReport]:
+        reports = []
+        if guids:
+            report_entities_collection = self._driver.entity_bulk(guid=guids)
+            for report_entity in extract_entities(report_entities_collection):
+                try:
+                    if report_entity.status == self.ENTITY_ACTIVE_STATUS:
+                        report_attrs = report_entity.attributes
+                        reports.append(
+                            ResourceReport(
+                                name=report_attrs['name'],
+                                url=report_attrs['url']
+                            )
+                        )
+                except (KeyError, AttributeError) as ex:
+                    LOGGER.exception('Error while accessing table report: {}. {}'
+                                     .format(str(report_entity), str(ex)))
+
+        parsed_reports = app.config['RESOURCE_REPORT_CLIENT'](reports) \
+            if app.config['RESOURCE_REPORT_CLIENT'] else reports
+
+        return parsed_reports
+
     def get_user(self, *, id: str) -> Union[UserEntity, None]:
         pass
 
@@ -361,6 +391,8 @@ class AtlasProxy(BaseProxy):
         try:
             attrs = table_details[self.ATTRS_KEY]
 
+            programmatic_descriptions = self._get_programmatic_descriptions(attrs.get('parameters'))
+
             table_qn = parse_table_qualified_name(
                 qualified_name=attrs.get(self.QN_KEY)
             )
@@ -377,6 +409,10 @@ class AtlasProxy(BaseProxy):
 
             columns = self._serialize_columns(entity=entity)
 
+            reports_guids = [report.get("guid") for report in attrs.get("reports") or list()]
+
+            is_view = True if attrs.get('tableType', '').lower().find('view') != -1 else False
+
             table = Table(
                 database=table_details.get('typeName'),
                 cluster=table_qn.get('cluster_name', ''),
@@ -385,8 +421,12 @@ class AtlasProxy(BaseProxy):
                 tags=tags,
                 description=attrs.get('description') or attrs.get('comment'),
                 owners=[User(email=attrs.get('owner'))],
+                resource_reports=self._get_reports(guids=reports_guids),
                 columns=columns,
-                last_updated_timestamp=self._parse_date(table_details.get('updateTime')))
+                is_view=is_view,
+                table_readers=self._get_readers(attrs.get(self.QN_KEY)),
+                last_updated_timestamp=self._parse_date(table_details.get('updateTime')),
+                programmatic_descriptions=programmatic_descriptions)
 
             return table
         except KeyError as ex:
@@ -596,8 +636,42 @@ class AtlasProxy(BaseProxy):
 
         return {'table': results}
 
-    def get_frequently_used_tables(self, *, user_email: str) -> Dict[str, Any]:
-        pass
+    def get_frequently_used_tables(self, *, user_email: str) -> Dict[str, List[PopularTable]]:
+        user = self._driver.entity_unique_attribute(self.USER_TYPE, qualifiedName=user_email).entity
+
+        readers_guids = []
+        for user_reads in user['relationshipAttributes'].get('entityReads'):
+            entity_status = user_reads['entityStatus']
+            relationship_status = user_reads['relationshipStatus']
+
+            if entity_status == 'ACTIVE' and relationship_status == 'ACTIVE':
+                readers_guids.append(user_reads['guid'])
+
+        readers = extract_entities(self._driver.entity_bulk(guid=readers_guids, ignoreRelationships=True))
+
+        _results = {}
+        for reader in readers:
+            entity_uri = reader.attributes.get(self.ENTITY_URI_KEY)
+            count = reader.attributes.get('count')
+
+            if count:
+                details = self._extract_info_from_uri(table_uri=entity_uri)
+
+                _results[count] = dict(cluster=details.get('cluster'),
+                                       name=details.get('name'),
+                                       schema=details.get('db'),
+                                       database=details.get('entity'))
+
+        sorted_counts = sorted(_results.keys())
+
+        results = []
+        for count in sorted_counts:
+            data: dict = _results.get(count, dict())
+            table = PopularTable(**data)
+
+            results.append(table)
+
+        return {'table': results}
 
     def add_resource_relation_by_user(self, *,
                                       id: str,
@@ -651,6 +725,74 @@ class AtlasProxy(BaseProxy):
             return int(date_trimmed)
         except Exception:
             return None
+
+    def _get_readers(self, qualified_name: str, top: Optional[int] = 15) -> List[Reader]:
+        params = {
+            'typeName': self.READER_TYPE,
+            'offset': '0',
+            'limit': top,
+            'excludeDeletedEntities': True,
+            'entityFilters': {
+                'condition': 'AND',
+                'criterion': [
+                    {
+                        'attributeName': self.QN_KEY,
+                        'operator': 'STARTSWITH',
+                        'attributeValue': qualified_name.split('@')[0] + '.'
+                    },
+                    {
+                        'attributeName': 'count',
+                        'operator': 'gte',
+                        'attributeValue': f'{app.config["POPULAR_TABLE_MINIMUM_READER_COUNT"]}'
+                    }
+                ]
+            },
+            'attributes': ['count', self.QN_KEY],
+            'sortBy': 'count',
+            'sortOrder': 'DESCENDING'
+        }
+
+        search_results = self._driver.search_basic.create(data=params, ignoreRelationships=False)
+
+        readers = []
+
+        for record in search_results.entities:
+            readers.append(record.guid)
+
+        results = []
+
+        if readers:
+            read_entities = extract_entities(self._driver.entity_bulk(guid=readers, ignoreRelationships=False))
+
+            for read_entity in read_entities:
+                reader = Reader(user=User(email=read_entity.relationshipAttributes['user']['displayText'],
+                                          user_id=read_entity.relationshipAttributes['user']['displayText']),
+                                read_count=read_entity.attributes['count'])
+
+                results.append(reader)
+
+        return results
+
+    def _get_programmatic_descriptions(self, parameters: dict) -> List[ProgrammaticDescription]:
+        programmatic_descriptions: Dict[str, ProgrammaticDescription] = {}
+
+        for source, text in parameters.items():
+            use_parameter = True
+
+            for regex_filter in app.config['PROGRAMMATIC_DESCRIPTIONS_EXCLUDE_FILTERS']:
+                pattern = re.compile(regex_filter)
+
+                if pattern.match(source):
+                    use_parameter = False
+                    break
+
+            if use_parameter:
+                source = re.sub("([a-z])([A-Z])", "\g<1> \g<2>", source).lower()
+                programmatic_descriptions[source] = ProgrammaticDescription(source=source, text=text)
+
+        result = dict(sorted(programmatic_descriptions.items()))
+
+        return list(result.values())
 
     def get_dashboard(self,
                       dashboard_uri: str,
