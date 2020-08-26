@@ -5,7 +5,7 @@ import os
 
 from setuptools import setup, find_packages
 
-__version__ = '2.5.4'
+__version__ = '2.5.5'
 
 
 requirements_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'requirements.txt')
@@ -16,9 +16,9 @@ setup(
     name='amundsen-metadata',
     version=__version__,
     description='Metadata service for Amundsen',
-    url='https://www.github.com/lyft/amundsenmetadatalibrary',
-    maintainer='Lyft',
-    maintainer_email='amundsen-dev@lyft.com',
+    url='https://www.github.com/amundsen-io/amundsenmetadatalibrary',
+    maintainer='Amundsen TSC',
+    maintainer_email='amundsen-tsc@lists.lfai.foundation',
     packages=find_packages(exclude=['tests*']),
     include_package_data=True,
     zip_safe=False,
