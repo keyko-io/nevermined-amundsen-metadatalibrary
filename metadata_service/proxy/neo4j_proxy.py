@@ -673,8 +673,8 @@ class Neo4jProxy(BaseProxy):
         # todo: Currently all the tags are default type, we could open it up if we want to include badge
         query = textwrap.dedent("""
         MATCH (t:Tag{tag_type: 'default'})
-        OPTIONAL MATCH (tbl:Table)-[:TAGGED_BY]->(t)
-        RETURN t as tag_name, count(distinct tbl.key) as tag_count
+        OPTIONAL MATCH (resource)-[:TAGGED_BY]->(t)
+        RETURN t as tag_name, count(distinct resource.key) as tag_count
         """)
 
         records = self._execute_cypher_query(statement=query,
@@ -887,8 +887,8 @@ class Neo4jProxy(BaseProxy):
 
         # FYI, to extract last_successful_execution, it searches for its execution ID which is always
         # _last_successful_execution
-        # https://github.com/lyft/amundsendatabuilder/blob/master/databuilder/models/dashboard/dashboard_execution.py#L18
-        # https://github.com/lyft/amundsendatabuilder/blob/master/databuilder/models/dashboard/dashboard_execution.py#L24
+        # https://github.com/amundsen-io/amundsendatabuilder/blob/master/databuilder/models/dashboard/dashboard_execution.py#L18
+        # https://github.com/amundsen-io/amundsendatabuilder/blob/master/databuilder/models/dashboard/dashboard_execution.py#L24
 
         query = textwrap.dedent(f"""
         MATCH {rel_clause}<-[:DASHBOARD]-(dg:Dashboardgroup)<-[:DASHBOARD_GROUP]-(clstr:Cluster)
